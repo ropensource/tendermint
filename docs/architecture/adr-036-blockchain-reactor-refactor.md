@@ -32,6 +32,20 @@ which will make testing of complex networking scenarios much simpler.
 
 ### Implementation changes
 
+We make the following assumptions of the system: 
+
+* a node is connected to a random subset of all nodes that represents its peer set. Some nodes are correct and some might be faulty. We don't make assumptions about ratio of  
+  faulty nodes, i.e., it is possible that all nodes in some peer set are faulty. 
+* we assume that communication between correct nodes is synchronous, i.e., if a correct node `p` sends a message `m` to a correct node `q` at time `t`, then `q` will receive
+  message the latest at time `t+Delta` where `Delta` is a system parameter that is known. `Delta` is normally order of magnitude bigger than the real communication delay 
+  (maximum) between correct nodes. Therefore if a correct node `p` sends a request message to a correct node `p` at time `t` and there is no the corresponding reply at time
+  `t + 2*Delta`, then `p` can assume that `q` is faulty. Note that the network assumptions for the consensus reactor are different 
+  (we assume partially synchronous network there). 
+* we assume that all correct peers will periodically send us `StatusReport` message with its current height. Some of those messages might be lost or delayed, but we will
+  eventually get more recent message that anyway supersedes the previous messages. We can think about these messages as some kind of heartbeat mechanism. `StatusReport` 
+  messages are not explicitly sent by `Controller`, i.e., we assume that sending of these messages is done by lower level mechanism, for example by Reactor itself.     
+    
+
 The `Controller` can be modelled as a function with clearly defined inputs:
 
 * `State` - current state of the node. Contains data about connected peers and its behavior, pending requests, received blocks, etc.
@@ -48,17 +62,24 @@ type Event int
 
 const (
 	EventUnknown Event = iota
+    StatusReport
+    BlockRequest
     NewBlock
-    AddPeer
     RemovePeer
     TimeoutInfo
 )
 
-type NewBlock struct {
-    Block Block,
+type BlockRequest struct {
     Height int64,
-    CurrentHeight int64,
-    PeerID ID
+    PeerID ID 
+}
+
+type NewBlock struct {
+    Height        int64,
+    Block         Block,
+    Commit        Commit
+    PeerID        ID,
+    CurrentHeight int64
 }
 
 type StatusReport struct {
@@ -88,13 +109,26 @@ type BlockRequestMessage struct {
     PeerID ID 
 }
 
+type BlockResponseMessage struct {
+    Height        int64,
+    Block         Block,
+    Commit        Commit
+    PeerID        ID,
+    CurrentHeight int64
+}
+
+type StatusReportMessage struct {
+    Height int64
+}
+
 type TimeoutTrigger struct {
     PeerID ID,
     Height int64,
     Duration time.Duration
 }
 
-The state machine has the following states (steps):
+The Controller state machine can be in two modes (states): `FastSyncMode` when it is trying to catch up with the network by downloading committed blocks,
+and `ConsensusMode` in which it executes Tendermint consensus protocol.  
 
 type State int
 
@@ -104,37 +138,36 @@ const (
 	ConsensusMode
 )
 
-Initially, a process is in `StepNoPeers` state. After some peers are added, it starts
-downloading blocks (`StepDownloadingBlocks`). Eventually, algorithm terminates by switching to consensus mode (`StepDone`). 
+Initially, a process is in `FastSyncMode`. Eventually, algorithm switches to the (`ConsensusMode`). 
 
-A node manages the following local state:
+A `Controller` has the following local state:
 
 type ControllerState struct {
-	Height              int64
-	State               State
-    PeerMap             map[ID]PeerStats     // map of peer IDs to outstanding block request (list can be used to support several outstanding requests) 
+	Height              int64                // the first block that is not committed 
+	State               State                // mode of operation of the state machine   
+    PeerMap             map[ID]PeerStats     // map of peer IDs to peer statistics (info about outstanding block requests and peer current height) 
     MaxRequestPending   int64                // maximum height of the pending requests
-    MaxPeerHeight       int64                // maximum height of the peer set
     FailedRequests      List[int64]          // list of failed block requests
     PendingRequestsNum  int                  // number of pending requests
-    Store               []BlockInfo
+    Store               []BlockInfo          // contains list of downloaded blocks
+    Executor            BlockExecutor        // store, verify and executes blocks 
 }
 
 type PeerStats struct {
 	Height              int64
-	PendingRequest      int64
+	PendingRequest      int64                 // it can be list in case there are multiple outstanding requests per peer
 }
 
 type BlockInfo struct {
-	Block   Block
-	PeerID  ID     
+    Block   Block   
+    Commit  Commit
+	PeerID  ID          // a peer from which we downloading the corresponding Block and Commit
 }
 
-func ControllerInit(state ControllerState) ControllerState {
-    state.Height = 0
+func ControllerInit(state ControllerState, startHeight int64) ControllerState {
+    state.Height = startHeight
     state.State = FastSyncMode
-    state.MaxRequestPending = 0
-    state.MaxPeerHeight = -1
+    state.MaxRequestPending = startHeight - 1 
     state.PendingRequestsNum = 0
 }
 
@@ -147,15 +180,19 @@ func ControllerHandle(event Event, state ControllerState) (ControllerState, Mess
         case ConsensusMode:
             switch event := event.(type) {
                 case BlockRequest:
-                     
+                    msg = createBlockResponseMessage(state, event)
                     return state, msg, timeout, error   
                 default: 
-                    error = "Received msg from unknown peer!"
+                    error = "Only respond to BlockRequests while in ConsensusMode!"
                     return state, msg, timeout, error  
             }
         
         case FastSyncMode: 
             switch event := event.(type) {
+                case BlockRequest:
+                    msg = createBlockResponseMessage(state, event)
+                    return state, msg, timeout, error
+                
                 case StatusReport:
                     if state.PeerMap[event.PeerID] does not exist {
                         peerStats = PeerStats {-1, -1}
@@ -209,6 +246,8 @@ func ControllerHandle(event Event, state ControllerState) (ControllerState, Mess
                         peerStats = state.PeerMap[event.PeerID]
                         if peerStats.PendingRequest == event.Height {
                             add(state.FailedRequests, pendingRequest)
+                            // TODO: Should I try to resend this request immediately to some peer that declare to have that block (before adding it to the failedRequests)?
+                            // Other option is to wait on status msg to come and to engage with a peer at that point with retried blocks!
                             delete(state.PeerMap, event.PeerID)
                             state.PendingRequestsNum--
                             error = "Not responsive peer"    
@@ -225,7 +264,26 @@ func ControllerHandle(event Event, state ControllerState) (ControllerState, Mess
     }
 }
 
-func createBlockRequestMessage(state State, peerID ID, peerHeight int64) BlockRequestMessage {
+func createBlockResponseMessage (state ControllerState, event BlockRequest) BlockResponseMessage {
+    msg = nil 
+    if state.PeerMap[event.PeerID] does not exist {
+        peerStats = PeerStats {-1, -1}
+    }
+    if state.Executor contains block with height event.Height and event.Height > peerStats.Height {
+        peerStats = event.Height
+        msg = BlockResponseMessage { 
+            Height: event.Height, 
+            Block: state.Executor.getBlock(eventHeight), 
+            Commit: state.Executor.getCommit(eventHeight),
+            PeerID: event.PeerID,
+            CurrentHeight: state.Height - 1 
+        }
+    }
+    state.PeerMap[event.PeerID] = peerStats
+    return msg
+}
+
+func createBlockRequestMessage(state ControllerState, peerID ID, peerHeight int64) BlockRequestMessage {
     msg = nil 
     blockNumber = -1
     if exist request r in state.FailedRequests such that r <= peerHeight {
@@ -241,16 +299,26 @@ func createBlockRequestMessage(state State, peerID ID, peerHeight int64) BlockRe
 func verifyBlocks(state State) State {
     done = false
     while state.Height < state.MaxPeerHeight and !done {
-        firstBlock = state.Pool[height]
-        secondBlock = state.Pool[height+1]
-        if firstBlock != nil and secondBlock != nil {
-            verificationResult = verify firstBlock using LastCommit from secondBlock
-            if verificationResult {
-                execute firstBlock
+        block = state.Store[height]
+        if block != nil {
+            verified = verify block.Block using block.Commit
+            if verified {
+                execute block  
                 state.Height++
+                if state.PeerMap[block.PeerID] exists { 
+                    if state.PeerMap[block.PeerID].Height > state.MaxPeerHeight { state.MaxPeerHeight = state.PeerMap[block.PeerID].Height }
+                    // TODO: How to reset max peer height upon peer remove! I need to remember not just declared peer height 
+                    // but also "confirmed" peer height. Computation of max peer height should take into account only "confirmed" peer heights?    
+                }
             } else { 
                 add(state.FailedRequests, height)
-                add(state.FailedRequests, height+1)
+                // TODO: extract this into function remove peer!
+                if state.PeerMap[block.PeerID] exists {
+                    pendingRequest = state.PeerMap[block.PeerID].PendingRequest
+                    if pendingRequest != -1 { add(state.FailedRequests, pendingRequest) }
+                    delete(state.PeerMap, event.PeerID) 
+                    if state.MaxPeerHeight == state.PeerMap[event.PeerID].Height { state.MaxPeerHeight = computeMaxPeerHeight(state) }       
+                }
                 done = true
             }   
         } else { done = true }
